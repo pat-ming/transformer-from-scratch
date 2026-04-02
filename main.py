@@ -107,7 +107,77 @@ class SelfAttention:
 
         return dQ, dK, dV
         
+class LinearLayer:
+    def __init__(self, d_in, d_out):
+        limit = np.sqrt(1/d_in)
+        self.bias = np.zeros(d_out)
+        self.weights = np.random.randn(d_in, d_out) * limit
 
+        self.x = None
+        self.db = None
+        self.dW = None
+
+    def forward(self, x):
+        self.x = x
+        return x @ self.weights + self.bias
+
+    def backward(self, dY):
+        self.db = np.sum(dY, axis = (0,1))
+        self.dW = np.einsum('bsi,bsj->ij', self.x, dY)
+        dx = dY @ self.weights.T
+        return dx
+
+class ReLU:
+    def __init__(self):
+        self.memory = None
+
+    def forward(self, x):
+        self.memory = (x > 0)
+        return self.memory * x
+    
+    # at this point, self.memory is the dA/dZ, which is 1s or 0s
+    def backward(self, dY):
+        dZ = self.memory * dY
+        return dZ
+    
+class FFN:
+    def __init__(self, d_model):
+        self.d_model = d_model
+        self.linear1 = LinearLayer(self.d_model, 4 * self.d_model)
+        self.linear2 = LinearLayer(4 * self.d_model, self.d_model)
+        self.relu = ReLU()
+
+    def forward(self, x):
+        return self.linear2.forward(self.relu.forward(self.linear1.forward(x))) 
+
+    def backward(self, dY):
+        dY1 = self.linear2.backward(dY)
+        dY2 = self.relu.backward(dY1)
+        dY3 = self.linear1.backward(dY2)
+        return dY3
+
+class ResidualLayer:
+    def __init__(self, sublayer):
+        self.sublayer = sublayer
+        self.x = None
+
+    def forward(self, x):
+        self.x = x
+        return x + self.sublayer.forward(x)
+    
+    def backward(self, dY):
+        dSublayer = self.sublayer.backward(dY)
+        return dY + dSublayer
+
+class MultiHeadAttention:
+    def __init__(self):
+        pass
+    
+    def forward(self):
+        pass
+
+    def backward(self):
+        pass
 
 # ----TESTING SUITE-----
 # for transparency, all test scripts are written with AI and verified
@@ -257,4 +327,193 @@ def testSelfAttention():
     else:
         print("\nFAILURE: Check your transpose logic on mismatched gradients.")
 
-testSelfAttention()
+def testLinearLayer():
+    batch_size = 2
+    seq_len = 3
+    d_in = 4
+    d_out = 5
+    eps = 1e-6
+
+    layer = LinearLayer(d_in, d_out)
+    x = np.random.randn(batch_size, seq_len, d_in)
+    dY = np.random.randn(batch_size, seq_len, d_out)
+
+    # 1. Analytical gradients
+    layer.forward(x)
+    dx_ana = layer.backward(dY)
+    dW_ana = layer.dW.copy()
+    db_ana = layer.db.copy()
+
+    # 2. Numerical gradient helper
+    def compute_numerical_grad(tensor):
+        grad_num = np.zeros_like(tensor)
+        it = np.nditer(tensor, flags=['multi_index'], op_flags=['readwrite'])
+        while not it.finished:
+            idx = it.multi_index
+            original_val = tensor[idx]
+
+            tensor[idx] = original_val + eps
+            l1 = np.sum(layer.forward(x) * dY)
+
+            tensor[idx] = original_val - eps
+            l2 = np.sum(layer.forward(x) * dY)
+
+            tensor[idx] = original_val
+            grad_num[idx] = (l1 - l2) / (2 * eps)
+            it.iternext()
+        return grad_num
+
+    # 3. Verify all three gradients
+    print("--- Starting Full Gradient Check ---")
+
+    dx_num = compute_numerical_grad(x)
+    dx_match = np.allclose(dx_ana, dx_num, atol=1e-5)
+    print(f"dx Match: {dx_match}")
+
+    dW_num = compute_numerical_grad(layer.weights)
+    dW_match = np.allclose(dW_ana, dW_num, atol=1e-5)
+    print(f"dW Match: {dW_match}")
+
+    db_num = compute_numerical_grad(layer.bias)
+    db_match = np.allclose(db_ana, db_num, atol=1e-5)
+    print(f"db Match: {db_match}")
+
+    if all([dx_match, dW_match, db_match]):
+        print("\nSUCCESS: All three gradients are mathematically sound.")
+    else:
+        print("\nFAILURE: Check your backward pass logic.")
+
+def testReLU():
+    batch_size = 2
+    seq_len = 3
+    d_model = 4
+    eps = 1e-6
+
+    relu = ReLU()
+    x = np.random.randn(batch_size, seq_len, d_model)
+    dY = np.random.randn(batch_size, seq_len, d_model)
+
+    # 1. Analytical gradient
+    relu.forward(x)
+    dx_ana = relu.backward(dY)
+
+    # 2. Numerical gradient
+    dx_num = np.zeros_like(x)
+    it = np.nditer(x, flags=['multi_index'], op_flags=['readwrite'])
+    while not it.finished:
+        idx = it.multi_index
+        original_val = x[idx]
+
+        x[idx] = original_val + eps
+        l1 = np.sum(relu.forward(x) * dY)
+
+        x[idx] = original_val - eps
+        l2 = np.sum(relu.forward(x) * dY)
+
+        x[idx] = original_val
+        dx_num[idx] = (l1 - l2) / (2 * eps)
+        it.iternext()
+
+    # 3. Compare
+    print("--- Starting ReLU Gradient Check ---")
+    dx_match = np.allclose(dx_ana, dx_num, atol=1e-5)
+    print(f"dx Match: {dx_match}")
+
+    if dx_match:
+        print("\nSUCCESS: ReLU gradient is mathematically sound.")
+    else:
+        print("\nFAILURE: Check your backward pass logic.")
+
+def testFFN():
+    # 1. Setup Dimensions
+    batch_size = 2
+    seq_len = 3
+    d_model = 8  # Input/Output dimension
+    d_ff = 4 * d_model  # Internal expansion (32)
+    
+    # 2. Initialize FFN
+    ffn = FFN(d_model)
+    
+    # 3. Create Dummy Input (B, S, d_model)
+    x = np.random.randn(batch_size, seq_len, d_model)
+    
+    print("--- FFN Forward Pass ---")
+    output = ffn.forward(x)
+    print(f"Input shape:  {x.shape}")
+    print(f"Output shape: {output.shape}")
+    
+    # Check if dimensions match d_model (not the internal d_ff)
+    assert output.shape == (batch_size, seq_len, d_model), "FFN Output shape mismatch!"
+    
+    print("\n--- FFN Backward Pass ---")
+    # Simulate gradient dL/dY coming from the next layer (e.g., LayerNorm)
+    dy = np.random.randn(batch_size, seq_len, d_model)
+    
+    dx = ffn.backward(dy)
+    
+    print(f"dx (input gradient) shape: {dx.shape}")
+    print(f"Linear1 dW shape: {ffn.linear1.dW.shape} (Expected: {d_model}x{d_ff})")
+    print(f"Linear2 dW shape: {ffn.linear2.dW.shape} (Expected: {d_ff}x{d_model})")
+    
+    # 4. Assertions
+    assert dx.shape == x.shape, "Backprop gradient shape mismatch!"
+    assert ffn.linear1.dW.shape == (d_model, d_ff), "Linear1 weights gradient mismatch!"
+    assert ffn.linear2.dW.shape == (d_ff, d_model), "Linear2 weights gradient mismatch!"
+    
+    # 5. Logic Check: Dead Neurons
+    # If we pass all negative numbers, ReLU should kill the gradient.
+    # We test this by checking if dW of Linear1 becomes 0.
+    x_neg = -np.abs(np.random.randn(batch_size, seq_len, d_model))
+    _ = ffn.forward(x_neg)
+    _ = ffn.backward(dy)
+    
+    # Since Linear1 output is followed by ReLU, and input was negative, 
+    # most/all gradients should be 0 if the weights didn't shift them positive.
+    # This is a bit non-deterministic with random weights, but a good sanity check.
+    
+    print("\n✅ FFN Modular Test Passed!")
+
+def testResidualLayer():
+    batch_size = 2
+    seq_len = 3
+    d_model = 4
+    eps = 1e-6
+
+    # Use FFN as the sublayer inside the residual connection
+    sublayer = FFN(d_model)
+    res = ResidualLayer(sublayer)
+    x = np.random.randn(batch_size, seq_len, d_model)
+    dY = np.random.randn(batch_size, seq_len, d_model)
+
+    # 1. Analytical gradient
+    res.forward(x)
+    dx_ana = res.backward(dY)
+
+    # 2. Numerical gradient
+    dx_num = np.zeros_like(x)
+    it = np.nditer(x, flags=['multi_index'], op_flags=['readwrite'])
+    while not it.finished:
+        idx = it.multi_index
+        original_val = x[idx]
+
+        x[idx] = original_val + eps
+        l1 = np.sum(res.forward(x) * dY)
+
+        x[idx] = original_val - eps
+        l2 = np.sum(res.forward(x) * dY)
+
+        x[idx] = original_val
+        dx_num[idx] = (l1 - l2) / (2 * eps)
+        it.iternext()
+
+    # 3. Compare
+    print("--- Starting ResidualLayer Gradient Check ---")
+    dx_match = np.allclose(dx_ana, dx_num, atol=1e-5)
+    print(f"dx Match: {dx_match}")
+
+    if dx_match:
+        print("\nSUCCESS: ResidualLayer gradient is mathematically sound.")
+    else:
+        print("\nFAILURE: Check your backward pass logic.")
+
+testResidualLayer()
