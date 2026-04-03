@@ -8,7 +8,12 @@
 # we will always assume that our input tensors are (batch, seq length, d_model)
 
 import numpy as np
+from tokenizers import Tokenizer
 np.set_printoptions(linewidth=200)
+
+def get_tokens():
+    tokenizer = Tokenizer.from_pretrained("gpt2")
+    return tokenizer
 
 # d_model is the hidden dimension of the tokens, we will use d_model = 8 for checking the math, and d_model = 512 for actual implementation
 class LayerNorm:
@@ -169,15 +174,116 @@ class ResidualLayer:
         dSublayer = self.sublayer.backward(dY)
         return dY + dSublayer
 
-class MultiHeadAttention:
-    def __init__(self):
-        pass
-    
-    def forward(self):
-        pass
+class PoistionalEncoding:
+    def __init__(self, seq_len, d_model):
+        self.pe = np.zeros((seq_len, d_model))
 
-    def backward(self):
-        pass
+        position = np.arange(seq_len)[:, np.newaxis]
+        log_term = np.arange(0, d_model, 2) * -(np.log(10000) / d_model)
+        freq = np.exp(log_term)
+
+        # broadcast
+        pos_enc_matrix = position * freq 
+
+        self.pe[:, 0::2] = np.sin(pos_enc_matrix)
+        self.pe[:, 1::2] = np.cos(pos_enc_matrix)
+
+        self.pe = self.pe[np.newaxis, :]
+    
+    def forward(self, x):
+        pe_slice = self.pe[:, :x.shape[1], :]
+        return x + pe_slice
+    
+    def backward(self, dY):
+        return dY
+
+class Embedding:
+    def __init__(self, vocab_size, d_model):
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+
+        # weight of tokens
+        self.W = np.random.rand(vocab_size, d_model) * 0.01
+        self.last_input_ids = None
+
+    # assume that english text has been passed through get_tokenizer()
+    def forward(self, input_ids):
+        self.last_input_ids = input_ids
+        return self.W[input_ids]
+
+    def backward(self, dY):
+        dW = np.zeros_like(self.W)
+        np.add.at(dW, self.last_input_ids, dY)
+        self.dW = dW
+        return None
+
+class MultiHeadAttention:
+    def __init__(self, d_model, heads):
+        self.d_model = d_model
+        self.heads = heads
+        self.d_k = d_model // heads
+
+        self.attention = SelfAttention(d_k=self.d_k)
+
+        self.q_lin = LinearLayer(d_model, d_model)
+        self.k_lin = LinearLayer(d_model, d_model)
+        self.v_lin = LinearLayer(d_model, d_model)
+    
+        self.output = LinearLayer(d_model, d_model)
+
+    def forward(self, x, mask=None):
+        batch, seq_len, d_model = x.shape
+
+        # project to respective subspaces
+        q = self.q_lin.forward(x)
+        k = self.k_lin.forward(x)
+        v = self.v_lin.forward(x)
+
+        # reshape to distribute across multiple heads
+        q = q.reshape(batch, seq_len, self.heads, self.d_k)
+        k = k.reshape(batch, seq_len, self.heads, self.d_k)
+        v = v.reshape(batch, seq_len, self.heads, self.d_k)
+
+        # transpose to: (batch, num_heads, seq_len, head_dim)
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        context = self.attention.forward(q, k, v, mask=mask)
+        context = context.transpose(0, 2, 1, 3)
+
+        # flatten: (batch, seq_len, d_model)
+        concat = context.reshape(batch, seq_len, self.d_model)
+
+        # final mixing projection
+        output = self.output.forward(concat)
+        
+        return output
+
+    # go in reverse order of the forward
+    def backward(self, dY):
+        batch, seq_len, _ = dY.shape
+
+        dOut = self.output.backward(dY)
+
+        # get back to 4d
+        dConcat = dOut.reshape(batch, seq_len, self.heads, self.d_k).transpose(0, 2, 1, 3)
+
+        # calculate 4D gradients
+        dQ_4D, dK_4D, dV_4D = self.attention.backward(dConcat)
+
+        # back to 3D for the projection to subspaces step
+        dQ = dQ_4D.transpose(0, 2, 1, 3).reshape(batch, seq_len, self.d_model)
+        dK = dK_4D.transpose(0, 2, 1, 3).reshape(batch, seq_len, self.d_model)
+        dV = dV_4D.transpose(0, 2, 1, 3).reshape(batch, seq_len, self.d_model)
+
+        # calculate gradient for projection process
+        dx_Q = self.q_lin.backward(dQ)
+        dx_K = self.k_lin.backward(dK)
+        dx_V = self.v_lin.backward(dV)
+
+        return dx_Q + dx_K + dx_V
+
 
 # ----TESTING SUITE-----
 # for transparency, all test scripts are written with AI and verified
@@ -516,4 +622,171 @@ def testResidualLayer():
     else:
         print("\nFAILURE: Check your backward pass logic.")
 
-testResidualLayer()
+def testPositionalEncoding():
+    batch_size = 2
+    seq_len = 10
+    d_model = 8
+
+    pe = PoistionalEncoding(seq_len, d_model)
+    x = np.random.randn(batch_size, seq_len, d_model)
+
+    # 1. Forward pass checks
+    print("--- Positional Encoding Forward Pass ---")
+    y = pe.forward(x)
+    print(f"Input shape:  {x.shape}")
+    print(f"Output shape: {y.shape}")
+    assert y.shape == x.shape, "Output shape mismatch!"
+
+    # The PE matrix should be deterministic — same input should give same output
+    y2 = pe.forward(x)
+    assert np.allclose(y, y2), "Positional encoding is not deterministic!"
+
+    # PE should add the same values regardless of batch — check that the difference is the same PE slice
+    diff = y - x
+    assert np.allclose(diff[0], diff[1]), "PE should be identical across batch dimension!"
+
+    # 2. Backward pass check — PE backward is identity (pass-through)
+    dY = np.random.randn(batch_size, seq_len, d_model)
+    dx = pe.backward(dY)
+    assert np.allclose(dx, dY), "Backward pass should be identity (pass-through)!"
+
+    # 3. Verify sin/cos pattern: even indices should be sin, odd should be cos
+    pe_vals = pe.pe[0, 0, :]  # First position
+    # Position 0: sin(0) = 0 for even indices, cos(0) = 1 for odd indices
+    assert np.allclose(pe_vals[0::2], 0.0, atol=1e-7), "sin(0) should be 0 for even dims!"
+    assert np.allclose(pe_vals[1::2], 1.0, atol=1e-7), "cos(0) should be 1 for odd dims!"
+
+    print("\nSUCCESS: Positional Encoding tests passed!")
+
+def testEmbedding():
+    vocab_size = 50
+    d_model = 8
+    batch_size = 2
+    seq_len = 4
+    eps = 1e-6
+
+    emb = Embedding(vocab_size, d_model)
+
+    # 1. Forward pass
+    input_ids = np.random.randint(0, vocab_size, size=(batch_size, seq_len))
+    print("--- Embedding Forward Pass ---")
+    y = emb.forward(input_ids)
+    print(f"Input shape:  {input_ids.shape}")
+    print(f"Output shape: {y.shape}")
+    assert y.shape == (batch_size, seq_len, d_model), "Output shape mismatch!"
+
+    # Check that the lookup is correct — each token should match its row in W
+    for b in range(batch_size):
+        for s in range(seq_len):
+            assert np.allclose(y[b, s], emb.W[input_ids[b, s]]), "Embedding lookup incorrect!"
+
+    # 2. Backward pass — numerical gradient check on W
+    dY = np.random.randn(batch_size, seq_len, d_model)
+    emb.forward(input_ids)
+    emb.backward(dY)
+    dW_ana = emb.dW.copy()
+
+    # Numerical gradient for W
+    dW_num = np.zeros_like(emb.W)
+    it = np.nditer(emb.W, flags=['multi_index'], op_flags=['readwrite'])
+    while not it.finished:
+        idx = it.multi_index
+        original_val = emb.W[idx]
+
+        emb.W[idx] = original_val + eps
+        l1 = np.sum(emb.forward(input_ids) * dY)
+
+        emb.W[idx] = original_val - eps
+        l2 = np.sum(emb.forward(input_ids) * dY)
+
+        emb.W[idx] = original_val
+        dW_num[idx] = (l1 - l2) / (2 * eps)
+        it.iternext()
+
+    print("\n--- Embedding Backward Pass ---")
+    dW_match = np.allclose(dW_ana, dW_num, atol=1e-5)
+    print(f"dW Match: {dW_match}")
+
+    if dW_match:
+        print("\nSUCCESS: Embedding gradient is mathematically sound.")
+    else:
+        print("\nFAILURE: Check your backward pass logic.")
+
+def testMultiHeadAttention():
+    np.random.seed(42)
+    batch_size = 2
+    seq_len = 4
+    d_model = 8
+    heads = 2
+    eps = 1e-6
+
+    mha = MultiHeadAttention(d_model, heads)
+    x = np.random.randn(batch_size, seq_len, d_model)
+    dY = np.random.randn(batch_size, seq_len, d_model)
+
+    # 1. Forward pass shape check
+    print("--- MHA Forward Pass ---")
+    output = mha.forward(x)
+    print(f"Input shape:  {x.shape}")
+    print(f"Output shape: {output.shape}")
+    assert output.shape == (batch_size, seq_len, d_model), "MHA output shape mismatch!"
+
+    # 2. Analytical gradient
+    mha.forward(x)
+    dx_ana = mha.backward(dY)
+    print(f"dx shape:     {dx_ana.shape}")
+    assert dx_ana.shape == x.shape, "MHA backward shape mismatch!"
+
+    # 3. Numerical gradient check on input x
+    print("\n--- MHA Numerical Gradient Check ---")
+    dx_num = np.zeros_like(x)
+    it = np.nditer(x, flags=['multi_index'], op_flags=['readwrite'])
+    while not it.finished:
+        idx = it.multi_index
+        original_val = x[idx]
+
+        x[idx] = original_val + eps
+        l1 = np.sum(mha.forward(x) * dY)
+
+        x[idx] = original_val - eps
+        l2 = np.sum(mha.forward(x) * dY)
+
+        x[idx] = original_val
+        dx_num[idx] = (l1 - l2) / (2 * eps)
+        it.iternext()
+
+    dx_match = np.allclose(dx_ana, dx_num, atol=1e-5)
+    rel_error = np.linalg.norm(dx_ana - dx_num) / (np.linalg.norm(dx_ana + dx_num) + 1e-10)
+    print(f"dx Match:       {dx_match}")
+    print(f"Relative Error: {rel_error:.6e}")
+
+    # 4. Check weight gradients for output projection
+    dW_out_ana = mha.output.dW.copy()
+    dW_out_num = np.zeros_like(mha.output.weights)
+    it = np.nditer(mha.output.weights, flags=['multi_index'], op_flags=['readwrite'])
+    while not it.finished:
+        idx = it.multi_index
+        original_val = mha.output.weights[idx]
+
+        mha.output.weights[idx] = original_val + eps
+        l1 = np.sum(mha.forward(x) * dY)
+
+        mha.output.weights[idx] = original_val - eps
+        l2 = np.sum(mha.forward(x) * dY)
+
+        mha.output.weights[idx] = original_val
+        dW_out_num[idx] = (l1 - l2) / (2 * eps)
+        it.iternext()
+
+    # need to re-run forward+backward to get analytical grads after wiggling weights
+    mha.forward(x)
+    mha.backward(dY)
+    dW_out_ana = mha.output.dW.copy()
+
+    dW_match = np.allclose(dW_out_ana, dW_out_num, atol=1e-5)
+    print(f"dW_out Match:   {dW_match}")
+
+    if dx_match and dW_match:
+        print("\nSUCCESS: MultiHeadAttention gradients are mathematically sound.")
+    else:
+        print("\nFAILURE: Check your backward pass logic.")
