@@ -15,26 +15,41 @@ All tensors follow the shape convention `(batch, seq_length, d_model)`.
 | Layer Normalization | Yes | Yes | Yes |
 | Softmax | Yes | Yes | Yes |
 | Scaled Dot-Product Self-Attention | Yes | Yes | Yes |
+| Linear Layer | Yes | Yes | Yes |
+| ReLU | Yes | Yes | Yes |
+| Feed-Forward Network | Yes | Yes | Yes |
+| Residual Connections | Yes | Yes | Yes |
+| Positional Encoding (Sinusoidal) | Yes | Yes | N/A (no learnable params) |
+| Embedding | Yes | Yes | Yes |
+| Multi-Head Attention | Yes | Yes | Yes |
+| Transformer Block (Pre-Norm) | Yes | Yes | Yes |
+| Cross-Entropy Loss (with Softmax) | Yes | Yes | Yes |
+| Full Decoder-Only Transformer | Yes | Yes | Yes |
+| SGD Optimizer | Yes | — | — |
 
-### Layer Normalization
-Normalizes inputs across the feature dimension with learnable `gamma` and `bias` parameters. The backward pass computes gradients for `dx`, `dgamma`, and `dbias`.
+### Architecture
 
-### Softmax
-Numerically stable softmax using the max-subtraction trick. Supports batched 4D tensors `(batch, heads, seq, keys)` for use inside attention.
+Decoder-only (GPT-style) transformer with pre-norm residual connections:
 
-### Scaled Dot-Product Self-Attention
-Computes `Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V` with optional masking. The backward pass produces gradients `dQ`, `dK`, and `dV`.
+```
+Input IDs → Embedding → Positional Encoding → [TransformerBlock x N] → LayerNorm → Linear → Logits
+```
 
-## Roadmap
+Each TransformerBlock:
+```
+x → LayerNorm → Multi-Head Attention → + x → LayerNorm → FFN → + residual
+```
 
-- [ ] Multi-Head Attention
-- [ ] Position-wise Feed-Forward Network
-- [ ] Positional Encoding
-- [ ] Residual Connections
-- [ ] Full Encoder Block
-- [ ] Full Decoder Block
-- [ ] End-to-end Transformer
-- [ ] Training loop with a toy task
+## Training
+
+Trained on a subset of Moby Dick using the GPT-2 tokenizer (vocab size 50,257). Achieved a loss of **0.0009** on the training set, confirming the model can learn.
+
+Hyperparameters:
+- `d_model = 128`
+- `num_heads = 8`
+- `num_layers = 2`
+- `seq_len = 32`
+- `optimizer = SGD`
 
 ## Testing
 
@@ -50,8 +65,8 @@ A successful run prints gradient match results for each component.
 
 ```
 transformer.scratch/
-├── main.py          # All component implementations and tests
-├── tests.ipynb      # Jupyter notebook for experimentation
+├── main.py                          # All component implementations, tests, and training
+├── training dataset/mobydick.txt    # Training data
 ├── README.md
 └── .gitignore
 ```
@@ -61,13 +76,15 @@ transformer.scratch/
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install numpy
+pip install numpy tokenizers matplotlib
 ```
 
 ## Requirements
 
 - Python 3.10+
 - NumPy
+- tokenizers (HuggingFace, for GPT-2 BPE tokenizer)
+- matplotlib (for loss plotting)
 
 ## Author
 
