@@ -174,7 +174,7 @@ class ResidualLayer:
         dSublayer = self.sublayer.backward(dY)
         return dY + dSublayer
 
-class PoistionalEncoding:
+class PositionalEncoding:
     def __init__(self, seq_len, d_model):
         self.pe = np.zeros((seq_len, d_model))
 
@@ -284,8 +284,156 @@ class MultiHeadAttention:
 
         return dx_Q + dx_K + dx_V
 
+class TransformerBlock:
+    # implemented with pre-norm.
+    def __init__(self, d_model, num_heads, dropout=0.1):
+        self.d_model = d_model
 
-# ----TESTING SUITE-----
+        # important layers
+        self.mha = MultiHeadAttention(d_model, num_heads)
+        self.ffn = FFN(d_model)
+
+        # norm layers
+        self.norm1 = LayerNorm(d_model)
+        self.norm2 = LayerNorm(d_model)
+
+    def forward(self, x, mask = None):
+        # pass through first 2 layers
+        norm1_out = self.norm1.forward(x)
+        mha_out = self.mha.forward(norm1_out, mask=mask)
+        # resid layer
+        block1_out = x + mha_out 
+
+        # pass the second 2 layers
+        norm2_out = self.norm2.forward(block1_out)
+        ffn_out = self.ffn.forward(norm2_out)
+        # resid layer
+        block2_out = block1_out + ffn_out
+
+        return block2_out
+    
+    def backward(self, dY):
+        # backprop through 2nd block
+        d_ffn = self.ffn.backward(dY)
+        d_norm2 = self.norm2.backward(d_ffn)
+        # residual gradient
+        dY1 = dY + d_norm2
+
+        # backprop through 1st block
+        d_mha = self.mha.backward(dY1)
+        d_norm1 = self.norm1.backward(d_mha)
+        # residual gradient
+        d_out = dY1 + d_norm1
+
+        return d_out
+
+class CrossEntropyLoss:
+    def __init__(self):
+        self.probs = None
+        self.targets = None
+        
+        self.softmax = SoftMax()
+
+    def forward(self, logits, targets, eps = 1e-9):
+        self.targets = targets
+        self.logits = logits
+
+        self.probs = self.softmax.forward(logits)
+
+        batch, seq_len = targets.shape
+        correct_probs = self.probs[np.arange(batch)[:, None], np.arange(seq_len), targets]
+
+        loss = -np.mean(np.log(correct_probs + eps))
+
+        return loss
+    
+    def backward(self):
+        batch, seq_len = self.targets.shape
+
+        dLogits = self.probs.copy()
+        dLogits[np.arange(batch)[:, None], np.arange(seq_len), self.targets] -= 1
+
+        dLogits /= (batch * seq_len)
+
+        return dLogits
+
+class Transformer:
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, max_seq_len = 5000):
+        self.embedding = Embedding(vocab_size, d_model)
+        self.pe = PositionalEncoding(max_seq_len, d_model)
+        self.blocks = [TransformerBlock(d_model, num_heads) for _ in range(num_layers)]
+        self.last_norm = LayerNorm(d_model)
+        self.last_linear = LinearLayer(d_model, vocab_size)
+        
+    def forward(self, ids):
+        seq_len = ids.shape[1]
+        mask = self.mask = np.tril(np.ones((seq_len, seq_len)))[np.newaxis, np.newaxis, :, :]
+
+        # embed ids to vectors, add positions.
+        x = self.embedding.forward(ids)
+        x = self.pe.forward(x) 
+
+        # loop through transformer blocks
+        for block in self.blocks: x = block.forward(x, mask=mask)
+
+        # cleaning up output
+        x = self.last_norm.forward(x)
+        x = self.last_linear.forward(x)
+
+        return x
+
+    def backward(self, dY):
+        # run everything in reverse, note that crossentropyloss already has softmax
+        dx = self.last_linear.backward(dY)
+        dx = self.last_norm.backward(dx)
+        for block in reversed(self.blocks): dx = block.backward(dx)
+        dx = self.pe.backward(dx)
+        dx = self.embedding.backward(dx)
+        return dx
+    
+    def getParameters(self):
+        params = []
+
+        # embedding layer
+        params.append((self.embedding, "W", "dW"))
+
+        # transformer blocks
+        for block in self.blocks:
+            for lin in [block.mha.q_lin, block.mha.k_lin, block.mha.v_lin, block.mha.output]:
+                params.append((lin, "weights", "dW"))
+                params.append((lin, "bias", "db"))
+
+            # norm layers and FFN
+            for norm in [block.norm1, block.norm2]:
+                params.append((norm, "gamma", "dgamma"))
+                params.append((norm, "bias", "dbias"))
+
+            # FFN linears
+            for ffn in [block.ffn.linear1, block.ffn.linear2]:
+                params.append((ffn, "weights", "dW"))
+                params.append((ffn, "bias", "db"))
+
+        # final layers
+        params.append((self.last_norm, "gamma", "dgamma"))
+        params.append((self.last_norm, "bias", "dbias"))
+        params.append((self.last_linear, "weights", "dW"))
+        params.append((self.last_linear, "bias", "db"))
+
+        return params
+
+class SGD:
+    def __init__(self, params, lr=1e-3):
+        self.params = params
+        self.lr = lr
+
+    def gradientStep(self):
+        for layer, param_label, grad_label in self.params:
+            param = getattr(layer, param_label)
+            grad = getattr(layer, grad_label)
+
+            param -= self.lr * grad
+
+# ----TESTING SUITE----
 # for transparency, all test scripts are written with AI and verified
 # with multiple agents. All classes are handwritten
 def testSoftmax():
@@ -627,7 +775,7 @@ def testPositionalEncoding():
     seq_len = 10
     d_model = 8
 
-    pe = PoistionalEncoding(seq_len, d_model)
+    pe = PositionalEncoding(seq_len, d_model)
     x = np.random.randn(batch_size, seq_len, d_model)
 
     # 1. Forward pass checks
@@ -790,3 +938,311 @@ def testMultiHeadAttention():
         print("\nSUCCESS: MultiHeadAttention gradients are mathematically sound.")
     else:
         print("\nFAILURE: Check your backward pass logic.")
+
+def testTransformerBlock():
+    np.random.seed(42)
+    batch_size = 1
+    seq_len = 3
+    d_model = 8
+    num_heads = 2
+    eps = 1e-6
+
+    block = TransformerBlock(d_model, num_heads)
+    x = np.random.randn(batch_size, seq_len, d_model)
+    dY = np.random.randn(batch_size, seq_len, d_model)
+
+    # 1. Forward pass shape check
+    print("--- TransformerBlock Forward Pass ---")
+    output = block.forward(x)
+    print(f"Input shape:  {x.shape}")
+    print(f"Output shape: {output.shape}")
+    assert output.shape == (batch_size, seq_len, d_model), "TransformerBlock output shape mismatch!"
+
+    # 2. Analytical gradient
+    block.forward(x)
+    dx_ana = block.backward(dY)
+    print(f"dx shape:     {dx_ana.shape}")
+    assert dx_ana.shape == x.shape, "TransformerBlock backward shape mismatch!"
+
+    # 3. Numerical gradient check on input x
+    print("\n--- TransformerBlock Numerical Gradient Check ---")
+    dx_num = np.zeros_like(x)
+    it = np.nditer(x, flags=['multi_index'], op_flags=['readwrite'])
+    while not it.finished:
+        idx = it.multi_index
+        original_val = x[idx]
+
+        x[idx] = original_val + eps
+        l1 = np.sum(block.forward(x) * dY)
+
+        x[idx] = original_val - eps
+        l2 = np.sum(block.forward(x) * dY)
+
+        x[idx] = original_val
+        dx_num[idx] = (l1 - l2) / (2 * eps)
+        it.iternext()
+
+    dx_match = np.allclose(dx_ana, dx_num, atol=1e-5)
+    rel_error = np.linalg.norm(dx_ana - dx_num) / (np.linalg.norm(dx_ana + dx_num) + 1e-10)
+    print(f"dx Match:       {dx_match}")
+    print(f"Relative Error: {rel_error:.6e}")
+
+    # 4. Check norm1 gamma gradient
+    block.forward(x)
+    block.backward(dY)
+    dgamma_ana = block.norm1.dgamma.copy()
+
+    dgamma_num = np.zeros_like(block.norm1.gamma)
+    it = np.nditer(block.norm1.gamma, flags=['multi_index'], op_flags=['readwrite'])
+    while not it.finished:
+        idx = it.multi_index
+        original_val = block.norm1.gamma[idx]
+
+        block.norm1.gamma[idx] = original_val + eps
+        l1 = np.sum(block.forward(x) * dY)
+
+        block.norm1.gamma[idx] = original_val - eps
+        l2 = np.sum(block.forward(x) * dY)
+
+        block.norm1.gamma[idx] = original_val
+        dgamma_num[idx] = (l1 - l2) / (2 * eps)
+        it.iternext()
+
+    block.forward(x)
+    block.backward(dY)
+    dgamma_ana = block.norm1.dgamma.copy()
+
+    dgamma_match = np.allclose(dgamma_ana, dgamma_num, atol=1e-5)
+    print(f"norm1 dgamma Match: {dgamma_match}")
+
+    if dx_match and dgamma_match:
+        print("\nSUCCESS: TransformerBlock gradients are mathematically sound.")
+    else:
+        print("\nFAILURE: Check your backward pass logic.")
+
+def testCrossEntropyLoss():
+    np.random.seed(42)
+    batch_size = 2
+    seq_len = 3
+    vocab_size = 10
+    eps = 1e-6
+
+    ce = CrossEntropyLoss()
+    logits = np.random.randn(batch_size, seq_len, vocab_size)
+    targets = np.random.randint(0, vocab_size, size=(batch_size, seq_len))
+
+    # 1. Forward pass
+    print("--- CrossEntropyLoss Forward Pass ---")
+    loss = ce.forward(logits, targets)
+    print(f"Logits shape:  {logits.shape}")
+    print(f"Targets shape: {targets.shape}")
+    print(f"Loss:          {loss:.6f}")
+    assert np.isscalar(loss) or loss.ndim == 0, "Loss should be a scalar!"
+    assert loss > 0, "Cross-entropy loss should be positive!"
+
+    # 2. Analytical gradient
+    ce.forward(logits, targets)
+    dLogits_ana = ce.backward()
+    print(f"dLogits shape: {dLogits_ana.shape}")
+    assert dLogits_ana.shape == logits.shape, "Gradient shape mismatch!"
+
+    # 3. Numerical gradient check on logits
+    print("\n--- CrossEntropyLoss Numerical Gradient Check ---")
+    dLogits_num = np.zeros_like(logits)
+    it = np.nditer(logits, flags=['multi_index'], op_flags=['readwrite'])
+    while not it.finished:
+        idx = it.multi_index
+        original_val = logits[idx]
+
+        logits[idx] = original_val + eps
+        l1 = ce.forward(logits, targets)
+
+        logits[idx] = original_val - eps
+        l2 = ce.forward(logits, targets)
+
+        logits[idx] = original_val
+        dLogits_num[idx] = (l1 - l2) / (2 * eps)
+        it.iternext()
+
+    dLogits_match = np.allclose(dLogits_ana, dLogits_num, atol=1e-5)
+    rel_error = np.linalg.norm(dLogits_ana - dLogits_num) / (np.linalg.norm(dLogits_ana + dLogits_num) + 1e-10)
+    print(f"dLogits Match:  {dLogits_match}")
+    print(f"Relative Error: {rel_error:.6e}")
+
+    # 4. Sanity check: perfect prediction should give low loss
+    perfect_logits = np.full((batch_size, seq_len, vocab_size), -10.0)
+    perfect_logits[np.arange(batch_size)[:, None], np.arange(seq_len), targets] = 10.0
+    perfect_loss = ce.forward(perfect_logits, targets)
+    print(f"\nPerfect prediction loss: {perfect_loss:.6e} (should be near 0)")
+
+    if dLogits_match:
+        print("\nSUCCESS: CrossEntropyLoss gradients are mathematically sound.")
+    else:
+        print("\nFAILURE: Check your backward pass logic.")
+
+def testTransformer():
+    np.random.seed(42)
+    vocab_size = 20
+    d_model = 8
+    num_heads = 2
+    num_layers = 2
+    batch_size = 1
+    seq_len = 4
+    eps = 1e-6
+
+    model = Transformer(vocab_size, d_model, num_heads, num_layers, max_seq_len=seq_len)
+    ce = CrossEntropyLoss()
+
+    input_ids = np.random.randint(0, vocab_size, size=(batch_size, seq_len))
+    targets = np.random.randint(0, vocab_size, size=(batch_size, seq_len))
+
+    # 1. Forward pass shape check
+    print("--- Transformer Forward Pass ---")
+    logits = model.forward(input_ids)
+    print(f"Input shape:   {input_ids.shape}")
+    print(f"Logits shape:  {logits.shape}")
+    assert logits.shape == (batch_size, seq_len, vocab_size), "Logits shape mismatch!"
+
+    # 2. Full forward + backward pass (through loss)
+    logits = model.forward(input_ids)
+    loss = ce.forward(logits, targets)
+    print(f"Loss:          {loss:.6f}")
+    dLogits = ce.backward()
+    model.backward(dLogits)
+    print("Forward + backward pass completed successfully.")
+
+    # 3. Numerical gradient check on embedding weights
+    print("\n--- Transformer Numerical Gradient Check (Embedding W) ---")
+    ce.forward(model.forward(input_ids), targets)
+    dLogits = ce.backward()
+    model.backward(dLogits)
+    dW_ana = model.embedding.dW.copy()
+
+    dW_num = np.zeros_like(model.embedding.W)
+    # Only check the rows that were actually used (for speed)
+    used_ids = np.unique(input_ids)
+    for token_id in used_ids:
+        for j in range(d_model):
+            idx = (token_id, j)
+            original_val = model.embedding.W[idx]
+
+            model.embedding.W[idx] = original_val + eps
+            l1 = ce.forward(model.forward(input_ids), targets)
+
+            model.embedding.W[idx] = original_val - eps
+            l2 = ce.forward(model.forward(input_ids), targets)
+
+            model.embedding.W[idx] = original_val
+            dW_num[idx] = (l1 - l2) / (2 * eps)
+
+    dW_match = np.allclose(dW_ana[used_ids], dW_num[used_ids], atol=1e-5)
+    rel_error = np.linalg.norm(dW_ana[used_ids] - dW_num[used_ids]) / (np.linalg.norm(dW_ana[used_ids] + dW_num[used_ids]) + 1e-10)
+    print(f"dW Match:       {dW_match}")
+    print(f"Relative Error: {rel_error:.6e}")
+
+    # 4. Numerical gradient check on last_linear weights
+    print("\n--- Transformer Numerical Gradient Check (Output Projection W) ---")
+    ce.forward(model.forward(input_ids), targets)
+    dLogits = ce.backward()
+    model.backward(dLogits)
+    dW_out_ana = model.last_linear.dW.copy()
+
+    dW_out_num = np.zeros_like(model.last_linear.weights)
+    it = np.nditer(model.last_linear.weights, flags=['multi_index'], op_flags=['readwrite'])
+    while not it.finished:
+        idx = it.multi_index
+        original_val = model.last_linear.weights[idx]
+
+        model.last_linear.weights[idx] = original_val + eps
+        l1 = ce.forward(model.forward(input_ids), targets)
+
+        model.last_linear.weights[idx] = original_val - eps
+        l2 = ce.forward(model.forward(input_ids), targets)
+
+        model.last_linear.weights[idx] = original_val
+        dW_out_num[idx] = (l1 - l2) / (2 * eps)
+        it.iternext()
+
+    ce.forward(model.forward(input_ids), targets)
+    dLogits = ce.backward()
+    model.backward(dLogits)
+    dW_out_ana = model.last_linear.dW.copy()
+
+    dW_out_match = np.allclose(dW_out_ana, dW_out_num, atol=1e-5)
+    rel_error2 = np.linalg.norm(dW_out_ana - dW_out_num) / (np.linalg.norm(dW_out_ana + dW_out_num) + 1e-10)
+    print(f"dW_out Match:   {dW_out_match}")
+    print(f"Relative Error: {rel_error2:.6e}")
+
+    if dW_match and dW_out_match:
+        print("\nSUCCESS: Transformer end-to-end gradients are mathematically sound.")
+    else:
+        print("\nFAILURE: Check your backward pass logic.")
+
+# ----TRAINING SUITE----
+# handwritten
+
+#(self, vocab_size, d_model, num_heads, num_layers, max_seq_len = 5000)
+epochs = 10
+d_model = 64
+num_heads = 8
+num_layers = 2
+lr = 1e-3
+tokenizer = get_tokens()
+vocab_size = tokenizer.get_vocab_size()
+model = Transformer(vocab_size = vocab_size, d_model = d_model, num_heads = num_heads, num_layers = num_layers)
+
+# generate dataset
+with open('training dataset/mobydick.txt', 'r') as f:
+    text = f.read()
+
+tokens = tokenizer.encode(text).ids
+tokens = np.array(tokens)
+
+seq_len = 64
+num_sequences = len(tokens) // (seq_len + 1)
+tokens = tokens[:num_sequences * (seq_len + 1)]
+tokens = tokens.reshape(num_sequences, seq_len+1)
+
+inputs = tokens[:, :-1]
+targets = tokens[:, 1:]
+
+batch_size = 2
+loss_fn = CrossEntropyLoss()
+params = model.getParameters()
+optimizer = SGD(params, lr=lr)
+
+loss_history = []
+
+for epoch in range(epochs):
+    # shuffle and loop over mini-batches
+    indices = np.arange(len(inputs))
+    np.random.shuffle(indices)
+    epoch_loss = 0
+    num_batches = len(inputs) // batch_size
+
+    for i in range(num_batches):
+        batch_idx = indices[i * batch_size : (i + 1) * batch_size]
+        batch_inputs = inputs[batch_idx]
+        batch_targets = targets[batch_idx]
+
+        logits = model.forward(batch_inputs)
+        loss = loss_fn.forward(logits, batch_targets)
+        dLogits = loss_fn.backward()
+        model.backward(dLogits)
+        optimizer.gradientStep()
+
+        epoch_loss += loss
+
+        if (i + 1) % 10 == 0 or i == 0:
+            print(f"  Epoch {epoch + 1} | Batch {i + 1}/{num_batches} | Loss: {loss:.4f}")
+
+    avg_loss = epoch_loss / num_batches
+    loss_history.append(avg_loss)
+    print(f"Epoch {epoch + 1}/{epochs} — Avg Loss: {avg_loss:.4f}")
+
+import matplotlib.pyplot as plt
+plt.plot(range(1, epochs + 1), loss_history)
+plt.xlabel("Epoch")
+plt.ylabel("Avg Loss")
+plt.title("Training Loss")
+plt.show()
