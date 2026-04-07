@@ -203,7 +203,7 @@ class Embedding:
         self.d_model = d_model
 
         # weight of tokens
-        self.W = np.random.rand(vocab_size, d_model) * 0.01
+        self.W = np.random.randn(vocab_size, d_model) * 0.01
         self.last_input_ids = None
 
     # assume that english text has been passed through get_tokenizer()
@@ -1182,11 +1182,11 @@ def testTransformer():
 # handwritten
 
 #(self, vocab_size, d_model, num_heads, num_layers, max_seq_len = 5000)
-epochs = 10
-d_model = 64
+epochs = 1000
+d_model = 128
 num_heads = 8
 num_layers = 2
-lr = 1e-3
+lr = 1e-2 * 2.5
 tokenizer = get_tokens()
 vocab_size = tokenizer.get_vocab_size()
 model = Transformer(vocab_size = vocab_size, d_model = d_model, num_heads = num_heads, num_layers = num_layers)
@@ -1194,11 +1194,12 @@ model = Transformer(vocab_size = vocab_size, d_model = d_model, num_heads = num_
 # generate dataset
 with open('training dataset/mobydick.txt', 'r') as f:
     text = f.read()
+text = text[:500]
 
 tokens = tokenizer.encode(text).ids
 tokens = np.array(tokens)
 
-seq_len = 64
+seq_len = 32
 num_sequences = len(tokens) // (seq_len + 1)
 tokens = tokens[:num_sequences * (seq_len + 1)]
 tokens = tokens.reshape(num_sequences, seq_len+1)
@@ -1206,7 +1207,7 @@ tokens = tokens.reshape(num_sequences, seq_len+1)
 inputs = tokens[:, :-1]
 targets = tokens[:, 1:]
 
-batch_size = 2
+batch_size = 1
 loss_fn = CrossEntropyLoss()
 params = model.getParameters()
 optimizer = SGD(params, lr=lr)
@@ -1238,7 +1239,7 @@ for epoch in range(epochs):
 
     avg_loss = epoch_loss / num_batches
     loss_history.append(avg_loss)
-    print(f"Epoch {epoch + 1}/{epochs} — Avg Loss: {avg_loss:.4f}")
+    #print(f"Epoch {epoch + 1}/{epochs} — Avg Loss: {avg_loss:.4f}")
 
 import matplotlib.pyplot as plt
 plt.plot(range(1, epochs + 1), loss_history)
